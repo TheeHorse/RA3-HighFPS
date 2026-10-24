@@ -208,6 +208,7 @@ static class Program
         uint render = FindRenderFps(img);
         List<uint> sites = FindPacingSites(img, render, render - 4);
         sites.AddRange(SelectSites(FindExtraSites(img, render, render - 4, sites), extra));
+        List<uint> logicRate = FindLogicRateReads(img, sites);
         if (ticks) sites.AddRange(FindTickStores(img, render, render - 4));
         uint pfxSim, pfxSite = FindParticleSim(img, out pfxSim);
         uint modelStep = FindModelTransitionStep(img);
@@ -238,7 +239,7 @@ static class Program
         if (pfxSite == 0 && fx.PfxSite != 0) { pfxSite = fx.PfxSite; pfxSim = fx.PfxSim; }   // tw / kw
         // for the log: which fixes this exe has, so reports from unknown builds say what's missing
         var have = new[] {
-            new { n = "sched", ok = schedSite != null }, new { n = "ffwd", ok = schedSite != null && schedSite.FfGlobal != 0 }, new { n = "scroll", ok = scrollSlot != 0 }, new { n = "camerakeys", ok = held != null },
+            new { n = "sched", ok = schedSite != null }, new { n = "logicrate", ok = logicRate.Count > 0 }, new { n = "ffwd", ok = schedSite != null && schedSite.FfGlobal != 0 }, new { n = "scroll", ok = scrollSlot != 0 }, new { n = "camerakeys", ok = held != null },
             new { n = "interp", ok = interpWindow.Count > 0 }, new { n = "limiter", ok = limiter != 0 }, new { n = "construction", ok = unpack != 0 },
             new { n = "anim2d", ok = anim2d.Count > 0 }, new { n = "models", ok = modelStep != 0 }, new { n = "particles", ok = pfxSite != 0 },
             new { n = "fades", ok = fades.Count > 0 || fx.Fades.Count > 0 }, new { n = "zoom", ok = zoomSite != 0 },
@@ -287,6 +288,12 @@ static class Program
             Redirect(proc, sites.Except(ratio).ToList(), (uint)mem);
         }
         else Redirect(proc, sites, (uint)mem);
+        if (On("logicrate") && logicRate.Count > 0)
+        {
+            // game logic reads of the fps float keep the stock render fps (30), so logic counts with 15 ticks a second
+            Write(proc, (uint)mem + 0x1F00, BitConverter.GetBytes((float)BitConverter.ToInt32(img, (int)(render - ImageBase))));
+            Redirect(proc, logicRate, (uint)mem + 0x1F00);
+        }
         if (On("zoom") && zoom > 1f && zoomSite != 0) PatchZoom(proc, zoomSite, netObject, zoom, (uint)mem + 0x98, (uint)mem + 0x4A0);
         if (On("fades") && fades.Count > 0) PatchFadeFrameReads(proc, img, fades, (uint)mem, (uint)mem + 0x440);
         if (On("scroll") && scrollSlot != 0 && fps > 30) PatchScrollBy(proc, scrollSlot, scrollFunc, fps, (uint)mem + 0x4F0, (uint)mem + 0x4F8, (uint)mem + 0x3C0);
@@ -321,7 +328,7 @@ static class Program
             (memOverlaps.Count > 0 ? "\r\nPATCH MEMORY OVERLAP (please report): " + string.Join(", ", memOverlaps.Distinct()) : "") +
             "\r\nsites: fps " + hex(sites) + " | fades " + hex(fades) + " | anim2d " + hex(anim2d) + " | construction " + hex(new[] { unpack }) +
             " | limiter " + hex(new[] { limiter }) + " | scroll " + hex(new[] { scrollSlot }) + " | zoom " + hex(new[] { zoomSite }) +
-            " | interp " + hex(interpWindow) + " | models " + hex(new[] { modelStep }) + " | particles " + hex(new[] { pfxSite }) +
+            " | logicrate " + hex(logicRate) + " | interp " + hex(interpWindow) + " | models " + hex(new[] { modelStep }) + " | particles " + hex(new[] { pfxSite }) +
             (schedSite != null ? " | sched " + hex(new[] { schedSite.Advance, schedSite.Exit }) : "") +
             (modeCheckFn != 0 ? " | newtick " + hex(new[] { modeCheckFn }) : "") +
             (schedSite != null && schedSite.FfGlobal != 0 ? " | ffwd 0x" + schedSite.FfGlobal.ToString("X") + "+" + schedSite.FfOff.ToString("X") : "") +
@@ -498,6 +505,37 @@ static class Program
             throw new Exception("Unsupported game build (main loop not found).");
         sites.Sort();
         return sites;
+    }
+
+    // the static init that keeps the render fps as a float (fild [fps] / fstp [x], 0xCE5110 in 1.13) is a pacing site,
+    // but game logic reads that float too: a few places take half of it as the logic rate (movss reg,[x] /
+    // mulss reg,[0.5f], 15 ticks a second at stock; 0x73F2A9, 0x76553C, 0x79B68B in 1.13). at 120 they counted with
+    // 60 and the logic itself came out different: a replay recorded at one fps went out of sync when played at
+    // another, and so would online games with different fps settings or one player without the mod (0x76553C alone
+    // does it). these reads get the stock value back (operands returned)
+    static List<uint> FindLogicRateReads(byte[] img, List<uint> sites)
+    {
+        var list = new List<uint>();
+        var floats = new List<uint>();
+        foreach (uint s in sites)
+        {
+            int o = (int)(s - ImageBase);   // fild operand: test / jge / fadd [2^32] / fstp [x]
+            if (o > 2 && img[o - 2] == 0xDB && img[o - 1] == 0x05 && img[o + 14] == 0xD9 && img[o + 15] == 0x1D)
+                floats.Add(BitConverter.ToUInt32(img, o + 16));
+        }
+        if (floats.Count == 0) return list;
+        int end = TextEnd(img);
+        for (int i = 0x1000; i < end - 16; i++)
+        {
+            // movss reg,[x] / mulss reg,[c] with the same reg and c = 0.5f
+            if (img[i] != 0xF3 || img[i + 1] != 0x0F || img[i + 2] != 0x10 || (img[i + 3] & 0xC7) != 0x05) continue;
+            if (!floats.Contains(BitConverter.ToUInt32(img, i + 4))) continue;
+            if (img[i + 8] != 0xF3 || img[i + 9] != 0x0F || img[i + 10] != 0x59 || (img[i + 11] & 0xC7) != 0x05) continue;
+            if (((img[i + 11] >> 3) & 7) != ((img[i + 3] >> 3) & 7)) continue;
+            int c = (int)(BitConverter.ToUInt32(img, i + 12) - ImageBase);
+            if (c > 0 && c + 4 <= img.Length && BitConverter.ToSingle(img, c) == 0.5f) list.Add(ImageBase + (uint)i + 4);
+        }
+        return list;
     }
 
     // all the other render_fps reads (mostly fild in visual code), minus stuff that has to stay 30:
